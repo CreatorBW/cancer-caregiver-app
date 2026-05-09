@@ -394,11 +394,20 @@ def parse_possible_date(value: Any) -> Optional[str]:
         return None
 
     text = str(value).strip()
+    lower = text.lower()
 
-    # Already ISO-ish
+    if lower in ["current", "latest", "recent", "now", "present"]:
+        return None
+
+    # Already ISO date
     if re.match(r"^\d{4}-\d{2}-\d{2}$", text):
         return text
 
+    # YYYY-MM
+    if re.match(r"^\d{4}-\d{2}$", text):
+        return f"{text}-01"
+
+    # Numeric date formats
     patterns = [
         ("%d.%m.%Y", r"\d{1,2}\.\d{1,2}\.\d{4}"),
         ("%d/%m/%Y", r"\d{1,2}/\d{1,2}/\d{4}"),
@@ -416,8 +425,127 @@ def parse_possible_date(value: Any) -> Optional[str]:
             except Exception:
                 pass
 
+    # Month name + year
+    month_map = {
+        "january": "01", "jan": "01",
+        "february": "02", "feb": "02",
+        "march": "03", "mar": "03",
+        "april": "04", "apr": "04",
+        "may": "05",
+        "june": "06", "jun": "06",
+        "july": "07", "jul": "07",
+        "august": "08", "aug": "08",
+        "september": "09", "sep": "09", "sept": "09",
+        "october": "10", "oct": "10",
+        "november": "11", "nov": "11",
+        "december": "12", "dec": "12",
+    }
+
+    # Handles: December 2021
+    match = re.search(
+        r"\b(january|jan|february|feb|march|mar|april|apr|may|june|jun|july|jul|august|aug|september|sept|sep|october|oct|november|nov|december|dec)\s*,?\s*(20\d{2}|19\d{2})\b",
+        lower
+    )
+    if match:
+        month = month_map.get(match.group(1))
+        year = match.group(2)
+        return f"{year}-{month}-01"
+
+    # Handles: Jan 2023 - Feb 2024 / January 2023 to February 2024
+    range_match = re.search(
+        r"\b(january|jan|february|feb|march|mar|april|apr|may|june|jun|july|jul|august|aug|september|sept|sep|october|oct|november|nov|december|dec)\s*,?\s*(20\d{2}|19\d{2})\s*(?:-|to|until|till)",
+        lower
+    )
+    if range_match:
+        month = month_map.get(range_match.group(1))
+        year = range_match.group(2)
+        return f"{year}-{month}-01"
+
+    # Handles: March/April 2024
+    slash_month_match = re.search(
+        r"\b(january|jan|february|feb|march|mar|april|apr|may|june|jun|july|jul|august|aug|september|sept|sep|october|oct|november|nov|december|dec)\s*/\s*(january|jan|february|feb|march|mar|april|apr|may|june|jun|july|jul|august|aug|september|sept|sep|october|oct|november|nov|december|dec)\s*,?\s*(20\d{2}|19\d{2})",
+        lower
+    )
+    if slash_month_match:
+        month = month_map.get(slash_month_match.group(1))
+        year = slash_month_match.group(3)
+        return f"{year}-{month}-01"
+
     return None
 
+
+def timeline_bucket(raw_date: Any, title: Any, details: Any) -> str:
+    text = f"{raw_date or ''} {title or ''} {details or ''}".lower()
+
+    if any(x in text for x in ["current", "latest", "present status", "current status"]):
+        return "Current / Latest"
+
+    parsed = parse_possible_date(raw_date)
+    if parsed:
+        return "Chronological"
+
+    return "Date Unclear"
+
+
+def timeline_sort_date(raw_date: Any) -> str:
+    parsed = parse_possible_date(raw_date)
+    if parsed:
+        return parsed
+
+    text = str(raw_date or "").lower()
+
+    if text in ["current", "latest", "recent", "now", "present"]:
+        return "9999-12-31"
+
+    return "9999-01-01"
+
+
+def timeline_display_date(raw_date: Any) -> str:
+    if raw_date in [None, ""]:
+        return "Date unclear"
+    return str(raw_date)
+
+
+def make_timeline_display_df(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+
+    out = df.copy()
+
+    out["Bucket"] = out.apply(
+        lambda r: timeline_bucket(r.get("Date"), r.get("Title"), r.get("Details")),
+        axis=1
+    )
+
+    out["Sort Date"] = out["Date"].apply(timeline_sort_date)
+    out["Display Date"] = out["Date"].apply(timeline_display_date)
+
+    # Collapse obvious duplicate display rows while keeping first source.
+    # This prevents repeated same historical facts from multiple summaries dominating the timeline.
+    out["Dedupe View Key"] = (
+        out["Sort Date"].astype(str).str.lower().str.strip()
+        + "|"
+        + out["Type"].astype(str).str.lower().str.strip()
+        + "|"
+        + out["Title"].astype(str).str.lower().str.replace(r"\s+", " ", regex=True).str.strip()
+    )
+
+    out = out.drop_duplicates(subset=["Dedupe View Key"], keep="first")
+
+    bucket_order = {
+        "Current / Latest": 0,
+        "Chronological": 1,
+        "Date Unclear": 2,
+    }
+
+    out["Bucket Order"] = out["Bucket"].map(bucket_order).fillna(9)
+
+    out = out.sort_values(
+        by=["Bucket Order", "Sort Date", "Type", "Title"],
+        ascending=[True, True, True, True]
+    )
+
+    return out.drop(columns=["Dedupe View Key", "Bucket Order"])
 
 def insert_ignore(query: str, params: tuple):
     try:
@@ -2225,15 +2353,16 @@ def get_treatment_df():
 
 
 def get_timeline_df():
-    return df_query("""
+    df = df_query("""
         SELECT event_date, event_type, title, details, source_document, confidence
         FROM timeline_events
-        ORDER BY
-            CASE WHEN event_date IS NULL THEN 1 ELSE 0 END,
-            event_date ASC,
-            created_at ASC
+        ORDER BY created_at ASC
     """, ["Date", "Type", "Title", "Details", "Source", "Confidence"])
 
+    if df.empty:
+        return df
+
+    return make_timeline_display_df(df)
 
 def get_scans_df():
     return df_query("""
@@ -2831,26 +2960,69 @@ def tab_timeline():
     st.header("Patient Timeline")
 
     df = get_timeline_df()
+
     if df.empty:
         st.info("No timeline events yet.")
         return
 
+    st.info(
+        "Timeline is grouped into Current / Latest, Chronological, and Date Unclear. "
+        "Older history repeated inside newer summaries is treated as historical context, not current status."
+    )
+
+    buckets = ["Current / Latest", "Chronological", "Date Unclear"]
+    selected_buckets = st.multiselect(
+        "Filter by timeline bucket",
+        buckets,
+        default=buckets
+    )
+
     event_types = sorted([x for x in df["Type"].dropna().unique().tolist() if x])
-    selected = st.multiselect("Filter by event type", event_types)
+    selected_types = st.multiselect("Filter by event type", event_types)
 
     filtered = df.copy()
-    if selected:
-        filtered = filtered[filtered["Type"].isin(selected)]
 
-    render_df(filtered, "No matching timeline events.")
+    if selected_buckets:
+        filtered = filtered[filtered["Bucket"].isin(selected_buckets)]
+
+    if selected_types:
+        filtered = filtered[filtered["Type"].isin(selected_types)]
+
+    display_cols = [
+        "Bucket",
+        "Display Date",
+        "Type",
+        "Title",
+        "Details",
+        "Source",
+        "Confidence",
+    ]
+
+    st.subheader("Timeline Table")
+    render_df(filtered[display_cols], "No matching timeline events.")
 
     st.subheader("Timeline Cards")
-    for _, row in filtered.iterrows():
-        st.markdown(f"### {row['Date'] or 'Date unclear'} — {row['Title'] or 'Event'}")
-        st.markdown(f"**Type:** {row['Type']}  \n**Source:** {row['Source']}  \n**Confidence:** {row['Confidence']}")
-        st.write(row["Details"])
-        st.divider()
 
+    for bucket in buckets:
+        section = filtered[filtered["Bucket"] == bucket]
+
+        if section.empty:
+            continue
+
+        st.markdown(f"## {bucket}")
+
+        for _, row in section.iterrows():
+            st.markdown(f"### {row['Display Date']} — {row['Title'] or 'Event'}")
+            st.markdown(
+                f"**Type:** {row['Type']}  \n"
+                f"**Source:** {row['Source']}  \n"
+                f"**Confidence:** {row['Confidence']}"
+            )
+
+            if row["Details"]:
+                st.write(row["Details"])
+
+            st.divider()
 
 def tab_scans():
     st.header("Scan Timeline")
