@@ -4,3 +4,16 @@ __pycache__/
 .DS_Store
 venv/
 .venv/
+
+# unrelated local projects/files
+download_youtube_urls_resumable.py
+extract_episode_numbers.py
+youtube_channel_backup_no_api.py
+youtube_channel_resumable_backup1.py
+taarak_mehta_backup/
+youtube_backup_downloads/
+titles.csv
+videos.csv
+videos.jsonl
+videos1.csv
+videos_with_episode_numbers.csv
